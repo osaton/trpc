@@ -11,6 +11,8 @@ import {
   MiddlewareResult,
   createInputMiddleware,
   createOutputMiddleware,
+  createSyncInputMiddleware,
+  createSyncOutputMiddleware,
 } from '../middleware';
 import { Parser, inferParser } from '../parser';
 import {
@@ -211,6 +213,85 @@ function createNewBuilder(
   } as any);
 }
 
+function createNewSyncBuilder(
+  def1: AnyProcedureBuilderDef,
+  def2: Partial<AnyProcedureBuilderDef>,
+) {
+  const { middlewares = [], inputs, ...rest } = def2;
+
+  // TODO: maybe have a fn here to warn about calls
+  return createSyncBuilder({
+    ...mergeWithoutOverrides(def1, rest),
+    inputs: [...def1.inputs, ...(inputs ?? [])],
+    middlewares: [...def1.middlewares, ...middlewares],
+  } as any);
+}
+
+export function createSyncBuilder<TConfig extends AnyRootConfig>(
+  initDef?: AnyProcedureBuilderDef,
+): ProcedureBuilder<{
+  _config: TConfig;
+  _ctx_out: TConfig['$types']['ctx'];
+  _input_in: UnsetMarker;
+  _input_out: UnsetMarker;
+  _output_in: UnsetMarker;
+  _output_out: UnsetMarker;
+  _meta: TConfig['$types']['meta'];
+}> {
+  const _def: AnyProcedureBuilderDef = initDef || {
+    inputs: [],
+    middlewares: [],
+  };
+
+  return {
+    _def,
+    input(input) {
+      const parser = getParseFn(input);
+      return createNewSyncBuilder(_def, {
+        inputs: [input],
+        middlewares: [createSyncInputMiddleware(parser)],
+      }) as AnyProcedureBuilder;
+    },
+    output(output: Parser) {
+      const parseOutput = getParseFn(output);
+      return createNewSyncBuilder(_def, {
+        output,
+        middlewares: [createSyncOutputMiddleware(parseOutput)],
+      }) as AnyProcedureBuilder;
+    },
+    meta(meta) {
+      return createNewSyncBuilder(_def, {
+        meta: meta as Record<string, unknown>,
+      }) as AnyProcedureBuilder;
+    },
+    unstable_concat(builder) {
+      return createNewSyncBuilder(_def, builder._def) as any;
+    },
+    use(middleware) {
+      return createNewSyncBuilder(_def, {
+        middlewares: [middleware],
+      }) as AnyProcedureBuilder;
+    },
+    query(resolver) {
+      return createSyncResolver(
+        { ..._def, query: true },
+        resolver,
+      ) as AnyQueryProcedure;
+    },
+    mutation(resolver) {
+      return createSyncResolver(
+        { ..._def, mutation: true },
+        resolver,
+      ) as AnyMutationProcedure;
+    },
+    subscription(resolver) {
+      return createSyncResolver(
+        { ..._def, subscription: true },
+        resolver,
+      ) as AnySubscriptionProcedure;
+    },
+  };
+}
 export function createBuilder<TConfig extends AnyRootConfig>(
   initDef?: AnyProcedureBuilderDef,
 ): ProcedureBuilder<{
@@ -299,6 +380,28 @@ function createResolver(
   return createProcedureCaller(finalBuilder._def);
 }
 
+function createSyncResolver(
+  _def: AnyProcedureBuilderDef,
+  resolver: (opts: ResolveOptions<any>) => MaybePromise<any>,
+) {
+  const finalBuilder = createNewBuilder(_def, {
+    resolver,
+    middlewares: [
+      function resolveMiddleware(opts) {
+        const data = resolver(opts);
+        return {
+          marker: middlewareMarker,
+          ok: true,
+          data,
+          ctx: opts.ctx,
+        } as const;
+      },
+    ],
+  });
+
+  return createSyncProcedureCaller(finalBuilder._def);
+}
+
 /**
  * @internal
  */
@@ -320,6 +423,77 @@ const caller = appRouter.createCaller({
 
 const result = await caller.call('myProcedure', input);
 `.trim();
+
+function createSyncProcedureCaller(_def: AnyProcedureBuilderDef): AnyProcedure {
+  const procedure = function resolve(opts: ProcedureCallOptions) {
+    // is direct server-side call
+    if (!opts || !('rawInput' in opts)) {
+      throw new Error(codeblock);
+    }
+
+    // run the middlewares recursively with the resolver as the last one
+    const callRecursive = (
+      callOpts: { ctx: any; index: number; input?: unknown } = {
+        index: 0,
+        ctx: opts.ctx,
+      },
+    ): MiddlewareResult<any> => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const middleware = _def.middlewares[callOpts.index]!;
+        const result = middleware({
+          ctx: callOpts.ctx,
+          type: opts.type,
+          path: opts.path,
+          rawInput: opts.rawInput,
+          meta: _def.meta,
+          input: callOpts.input,
+          next: (nextOpts?: { ctx: any; input?: any }) => {
+            return callRecursive({
+              index: callOpts.index + 1,
+              ctx:
+                nextOpts && 'ctx' in nextOpts
+                  ? { ...callOpts.ctx, ...nextOpts.ctx }
+                  : callOpts.ctx,
+              input:
+                nextOpts && 'input' in nextOpts
+                  ? nextOpts.input
+                  : callOpts.input,
+            });
+          },
+        });
+        return result as unknown as MiddlewareResult<any>;
+      } catch (cause) {
+        return {
+          ok: false,
+          error: getTRPCErrorFromUnknown(cause),
+          marker: middlewareMarker,
+        };
+      }
+    };
+
+    // there's always at least one "next" since we wrap this.resolver in a middleware
+    const result = callRecursive();
+
+    if (!result) {
+      throw new TRPCError({
+        code: 'INTERNAL_SERVER_ERROR',
+        message:
+          'No result from middlewares - did you forget to `return next()`?',
+      });
+    }
+
+    if (!result.ok) {
+      // re-throw original error
+      throw result.error;
+    }
+    return result.data;
+  };
+  procedure._def = _def;
+  procedure.meta = _def.meta;
+
+  return procedure as AnyProcedure;
+}
 
 function createProcedureCaller(_def: AnyProcedureBuilderDef): AnyProcedure {
   const procedure = async function resolve(opts: ProcedureCallOptions) {

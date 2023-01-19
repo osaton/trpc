@@ -1,3 +1,4 @@
+import { MaybePromise } from '@trpc/server';
 import { TRPCError } from '../error/TRPCError';
 import { getCauseFromUnknown } from '../error/utils';
 import { AnyRootConfig } from './internals/config';
@@ -59,8 +60,8 @@ export type MiddlewareFunction<
     rawInput: unknown;
     meta: TParams['_meta'] | undefined;
     next: {
-      (): Promise<MiddlewareResult<TParams>>;
-      <$Context>(opts: { ctx: $Context }): Promise<
+      (): MaybePromise<MiddlewareResult<TParams>>;
+      <$Context>(opts: { ctx: $Context }): MaybePromise<
         MiddlewareResult<{
           _config: TParams['_config'];
           _ctx_out: $Context;
@@ -72,7 +73,37 @@ export type MiddlewareFunction<
         }>
       >;
     };
-  }): Promise<MiddlewareResult<TParamsAfter>>;
+  }): MaybePromise<MiddlewareResult<TParamsAfter>>;
+  _type?: string | undefined;
+};
+
+/**
+ * @internal
+ */
+export type MiddlewareFunctionSync<
+  TParams extends ProcedureParams,
+  TParamsAfter extends ProcedureParams,
+> = {
+  (opts: {
+    ctx: TParams['_ctx_out'];
+    type: ProcedureType;
+    path: string;
+    input: TParams['_input_out'];
+    rawInput: unknown;
+    meta: TParams['_meta'] | undefined;
+    next: {
+      (): MiddlewareResult<TParams>;
+      <$Context>(opts: { ctx: $Context }): MiddlewareResult<{
+        _config: TParams['_config'];
+        _ctx_out: $Context;
+        _input_in: TParams['_input_in'];
+        _input_out: TParams['_input_out'];
+        _output_in: TParams['_output_in'];
+        _output_out: TParams['_output_out'];
+        _meta: TParams['_meta'];
+      }>;
+    };
+  }): MiddlewareResult<TParamsAfter>;
   _type?: string | undefined;
 };
 
@@ -82,6 +113,29 @@ export type MiddlewareFunction<
 // FIXME this should use RootConfig
 export function createMiddlewareFactory<TConfig extends AnyRootConfig>() {
   return function createMiddleware<TNewParams extends ProcedureParams>(
+    fn: MiddlewareFunction<
+      {
+        _config: TConfig;
+        _ctx_out: TConfig['$types']['ctx'];
+        _input_out: unknown;
+        _input_in: unknown;
+        _output_in: unknown;
+        _output_out: unknown;
+        _meta: TConfig['$types']['meta'];
+      },
+      TNewParams
+    >,
+  ) {
+    return fn;
+  };
+}
+
+/**
+ * @internal
+ */
+// FIXME this should use RootConfig
+export function createSyncMiddlewareFactory<TConfig extends AnyRootConfig>() {
+  return function createSyncMiddleware<TNewParams extends ProcedureParams>(
     fn: MiddlewareFunction<
       {
         _config: TConfig;
@@ -141,6 +195,42 @@ export function createInputMiddleware<TInput>(parse: ParseFn<TInput>) {
 
 /**
  * @internal
+ * Please note, `trpc-openapi` uses this function.
+ */
+export function createSyncInputMiddleware<TInput>(parse: ParseFn<TInput>) {
+  const inputMiddleware: ProcedureBuilderMiddleware = ({
+    next,
+    rawInput,
+    input,
+  }) => {
+    let parsedInput: ReturnType<typeof parse>;
+    try {
+      parsedInput = parse(rawInput);
+    } catch (cause) {
+      throw new TRPCError({
+        code: 'BAD_REQUEST',
+        cause: getCauseFromUnknown(cause),
+      });
+    }
+
+    // Multiple input parsers
+    const combinedInput =
+      isPlainObject(input) && isPlainObject(parsedInput)
+        ? {
+            ...input,
+            ...parsedInput,
+          }
+        : parsedInput;
+
+    // TODO fix this typing?
+    return next({ input: combinedInput } as any);
+  };
+  inputMiddleware._type = 'input';
+  return inputMiddleware;
+}
+
+/**
+ * @internal
  */
 export function createOutputMiddleware<TOutput>(parse: ParseFn<TOutput>) {
   const outputMiddleware: ProcedureBuilderMiddleware = async ({ next }) => {
@@ -151,6 +241,34 @@ export function createOutputMiddleware<TOutput>(parse: ParseFn<TOutput>) {
     }
     try {
       const data = await parse(result.data);
+      return {
+        ...result,
+        data,
+      };
+    } catch (cause) {
+      throw new TRPCError({
+        message: 'Output validation failed',
+        code: 'INTERNAL_SERVER_ERROR',
+        cause: getCauseFromUnknown(cause),
+      });
+    }
+  };
+  outputMiddleware._type = 'output';
+  return outputMiddleware;
+}
+
+/**
+ * @internal
+ */
+export function createSyncOutputMiddleware<TOutput>(parse: ParseFn<TOutput>) {
+  const outputMiddleware: ProcedureBuilderMiddleware = ({ next }) => {
+    const result = next() as MiddlewareResult<any>;
+    if (!result.ok) {
+      // pass through failures without validating
+      return result;
+    }
+    try {
+      const data = parse(result.data);
       return {
         ...result,
         data,

@@ -90,6 +90,20 @@ export interface Procedure<
   (opts: ProcedureCallOptions): Promise<unknown>;
 }
 
+/**
+ *
+ * @internal
+ */
+export interface ProcedureSync<
+  TType extends ProcedureType,
+  TParams extends ProcedureParams,
+> extends Procedure<TType, TParams> {
+  /**
+   * @internal
+   */
+  (opts: ProcedureCallOptions): unknown;
+}
+
 export type AnyQueryProcedure = Procedure<'query', any>;
 export type AnyMutationProcedure = Procedure<'mutation', any>;
 export type AnySubscriptionProcedure = Procedure<'subscription', any>;

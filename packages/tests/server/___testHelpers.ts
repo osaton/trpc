@@ -138,6 +138,28 @@ export async function waitError<TError extends Error = Error>(
   throw new Error('Function did not throw');
 }
 
+export function handleError<TError extends Error = Error>(
+  /**
+   * Function callback or promise that you expect will throw
+   */ fn: () => unknown,
+  /**
+   * Force error constructor to be of specific type
+   * @default Error
+   **/
+  errorConstructor?: Constructor<TError>,
+) {
+  try {
+    fn();
+  } catch (cause) {
+    expect(cause).toBeInstanceOf(Error);
+    if (errorConstructor) {
+      expect((cause as Error).name).toBe(errorConstructor.name);
+    }
+    return cause as TError;
+  }
+  throw new Error('Function did not throw');
+}
+
 export const ignoreErrors = async (fn: () => Promise<unknown> | unknown) => {
   try {
     await fn();

@@ -104,6 +104,21 @@ type DecoratedProcedureRecord<TProcedures extends ProcedureRouterRecord> = {
     : never;
 };
 
+type DecoratedSyncProcedureRecord<TProcedures extends ProcedureRouterRecord> = {
+  [TKey in keyof TProcedures]: TProcedures[TKey] extends AnyRouter
+    ? DecoratedProcedureRecord<TProcedures[TKey]['_def']['record']>
+    : TProcedures[TKey] extends AnyProcedure
+    ? UnwrapReturnType<DecorateProcedure<TProcedures[TKey]>>
+    : never;
+};
+
+type Unwrap<TResult> = TResult extends Promise<infer Inner> ? Inner : TResult;
+type UnwrapReturnType<TResult> = TResult extends (
+  ...args: infer Args
+) => Promise<infer Inner>
+  ? (...args: Args) => Inner
+  : TResult;
+
 /**
  * @internal
  */
@@ -124,8 +139,16 @@ type RouterCaller<TDef extends AnyRouterDef> = (
   subscription: inferHandlerFn<TDef['subscriptions']>;
 } & DecoratedProcedureRecord<TDef['record']>;
 
+/**
+ * @internal
+ */
+type RouterSyncCaller<TDef extends AnyRouterDef> = (
+  ctx: TDef['_config']['$types']['ctx'],
+) => DecoratedSyncProcedureRecord<TDef['record']>;
+
 export interface Router<TDef extends AnyRouterDef> {
   _def: TDef;
+  createSyncCaller: RouterSyncCaller<TDef>;
   createCaller: RouterCaller<TDef>;
   // FIXME rename me and deprecate
   getErrorShape(opts: {
@@ -235,6 +258,42 @@ export function createRouterFactory<TConfig extends AnyRootConfig>(
     const router: AnyRouter = {
       ...procedures,
       _def,
+      createSyncCaller(ctx) {
+        const proxy = createRecursiveProxy(({ path, args }) => {
+          // interop mode
+          if (
+            path.length === 1 &&
+            procedureTypes.includes(path[0] as ProcedureType)
+          ) {
+            return callProcedure({
+              procedures: _def.procedures,
+              path: args[0] as string,
+              rawInput: args[1],
+              ctx,
+              type: path[0] as ProcedureType,
+            });
+          }
+
+          const fullPath = path.join('.');
+          const procedure = _def.procedures[fullPath] as AnyProcedure;
+
+          let type: ProcedureType = 'query';
+          if (procedure._def.mutation) {
+            type = 'mutation';
+          } else if (procedure._def.subscription) {
+            type = 'subscription';
+          }
+
+          return procedure({
+            path: fullPath,
+            rawInput: args[0],
+            ctx,
+            type,
+          });
+        });
+
+        return proxy as ReturnType<RouterCaller<any>>;
+      },
       createCaller(ctx) {
         const proxy = createRecursiveProxy(({ path, args }) => {
           // interop mode
